@@ -1,0 +1,1458 @@
+//+------------------------------------------------------------------+
+//|                                                       MaTest.mq4 |
+//|                                  Copyright 2025, MetaQuotes Ltd. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, MetaQuotes Ltd."
+#property link      "https://www.mql5.com"
+#property version   "1.4.0"
+#property strict
+
+// 输入参数
+input bool SuspendOpenOrder = False;   // 暂停开仓
+input int BBPeriod = 30;         // 布林带时间范围
+input double BBDeviation = 2.5;  // 布林带标准差倍数
+input double LotSize = 0.01;     // 最小手数
+input double TrendLotSize = 0.1;    // 趋势手数
+input double MaxLotSizeFactor = 10;    // 最大手数因子
+input ENUM_TIMEFRAMES BaseTimeFrame = PERIOD_M1; // 基准周期，默认1分钟
+input ENUM_TIMEFRAMES TrendTimeFrame = PERIOD_M30;   // 趋势检查周期
+
+input int MaxStopLossPoints = 5000;   // 最大止损点数
+input int MiniStopLossPoints = 500;   // 最小止损点数
+input int SlippagePoints = 3;   // 下单最大滑点点数
+input int RSIPeriod = 14;              // RSI 周期
+input double MiniMASpread = 100;   // 最小均值偏差点数
+input double MaxMASpread = 500;   // 最大均值偏差点数
+input double BaseMASpread = 300;   // 基准均值偏差点数
+//input double InitialCapital = 0;    // 用户初始本金（USD）
+input double MiniProfit = 1;   // 最小利润阈值（USD）
+input double MaxProfit = 5;   // 最大利润阈值（USD）
+input double MiniMarginLevelThreshold = 5;   // 最小预付款比例阈值
+ double MartinFactor = 1.2;   // 马丁格因子
+ENUM_TIMEFRAMES ATRTimeFrame = PERIOD_H1;   // ATR时间周期
+int ATRPeriod = 14;   // ATR时间范围
+
+input int LotSizeFibonacciMaxIndex = 6;   // 用于订单手数计算的斐波拉契数列最大索引
+input int MASpreadFibonacciMaxIndex = 5;   // 用于价差计算的斐波拉契数列最大索引
+input double TotalMaxLot = 5.0;  //最大持仓量
+input int OrderTimeSpreadThreshold = 600; // 短线建仓时间间隔（秒）
+ int MaxHoldHours = 48;   // 最大持仓时间(小时)
+input int MagicNumber = 0;    // 用户订单标识符
+
+// 全局变量
+double upperBand, lowerBand;
+//最小持仓精度
+double LotPrecision = 0;
+
+// int最大值
+int MaxInt = (1 << 31) - 1;
+
+// 点数基准值
+double PointValue = 0.0;
+double TickValue = 0.0;
+datetime LastM1BarTime = 0;
+
+//当前K线在BollingBand中的位置，
+//0未知，1上穿中轨，2中轨上方，3上穿上轨，4上轨上方，
+//-1下穿中轨，-2下轨下方，-3下穿下轨，-4下轨下方
+// 短周期通道
+int CurrentBaseBBPos = 0;
+// 倒数第一根K线趋势周期通道
+int LastTrendBBPos = 0;
+// 当前K线趋势周期通道
+int CurrentTrendBBPos = 0;
+// 当前趋势方向，0未知，1上上行趋势，-1下行趋势
+int CurrentTrendDirect = 0;
+
+
+// 交易相关参数
+int OpenLongOrderIndex = 0;
+int OpenShortOrderIndex = 0;
+
+// MA点差阈值
+double MASpreadThreshold = MaxMASpread;
+
+// 持仓相关信息
+double CurrentLongTrendLot = 0;
+double CurrentLongTrendProfit = 0;
+double LastLongTrendOrderPrice = 0;
+double LastLongTrendLotSize = 0;
+datetime LastLongTrendOrderTime = 0;
+double CurrentLongTrendProfitRatio = 0;
+
+double CurrentLongAppendLot = 0;
+double CurrentLongAppendProfit = 0;
+double FirstOpenLongOrderPrice = -1;
+datetime FirstOpenLongOrderTime = 0;
+double LastOpenLongOrderPrice = -1;
+double LastOpenLongLotSize = LotSize;
+datetime LastOpenLongOrderTime = 0;
+double CurrentLongAppendProfitRatio = 0; // 当前多仓利润率比例
+
+
+// 空仓相关信息
+double CurrentShortAppendLot = 0;
+double CurrentShortAppendProfit = 0;
+double FirstOpenShortOrderPrice = -1;
+datetime FirstOpenShortOrderTime = 0;
+double LastOpenShortOrderPrice = -1;
+double LastOpenShortLotSize = LotSize;
+datetime LastOpenShortOrderTime = 0;
+double CurrentShortAppendProfitRatio = 0;
+
+
+// 用户的初始账户余额
+double InitialCapital = 0;
+// 初始杠杆倍数
+int initialLeverage = 0;
+
+// 历史净值相关
+int EquityHistoryCount = 0;
+double EquityHistory[];
+datetime EquityHistoryTime[];
+
+// 最小预付款比例
+double MiniMarginLevel = MaxInt;
+datetime MiniMarginLevelTime = 0;
+// 当前预付款比例
+double CurrentMarginLevel = MaxInt;
+
+// 默认动态数组长度
+int INITIAL_ARRAY_SIZE = 1000;
+// 无风险利率
+double RISK_FREE_RATE = 0.01;
+
+
+// 初始化
+int OnInit() {
+   PointValue = MarketInfo(Symbol(), MODE_POINT);
+   if(PointValue == 0)
+      PointValue = Point; // Fallback for brokers
+
+   TickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
+   Print("每点价值：TickValue=", DoubleToString(TickValue, 2));
+
+   // 初始化仓位精度
+   GetPrecision(LotSize);
+   Print("LotPrecision 已调整为标准值 ", LotPrecision);
+
+   // 初始化用户本金
+   InitialCapital = AccountBalance();
+   initialLeverage = AccountLeverage();
+
+   // 初始化动态数组
+   //ArrayResize(EquityHistory, INITIAL_ARRAY_SIZE);
+   //ArrayResize(EquityHistoryTime, INITIAL_ARRAY_SIZE);
+
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason) {
+   if(IsTesting()) {
+      CalculateSharpeRatio();
+      CalculateMaxDrawdown();
+      CalculateOptimalLeverage();
+   }
+}
+
+
+// 主循环
+void OnTick() {
+   //--- 以M1为价格的检查周期
+   datetime m1_time = iTime(NULL, BaseTimeFrame, 0);
+   if(m1_time == LastM1BarTime)
+      return;
+   LastM1BarTime = m1_time;
+
+   //Print("BaseTimeFrame = ", DoubleToString(BaseTimeFrame, 2));
+
+
+   // 刷新MA点差阈值
+   //RefreshATRThreshold();
+
+   // 刷新持仓数据
+   RefreshPosition();
+
+   // 刷新BollingBand信号
+   RefreshBollingBandSignal();
+
+   //均值回归信号
+   MAReversionSignal();
+
+   // 更新净值历史
+   UpdateEquityHistory();
+
+   // 更新预付款比例
+   UpdateMarginLevel();
+
+   // 在回测结束时计算夏普率
+   if(IsTesting() && IsVisualMode() && EquityHistoryCount > 100) { // 确保有足够数据
+      CalculateSharpeRatio();
+      CalculateMaxDrawdown();
+   }
+
+}
+
+
+// 检查开仓信号并下单
+void CheckAndOpenOrder(int orderType, double lotSize, double stopLossPoint, string comment)
+{
+   if (SuspendOpenOrder){
+      Print("暂停开仓，如需开仓请设置该参数位True");
+      return;
+   }
+
+   if (CurrentMarginLevel <= MiniMarginLevelThreshold){
+      Print("当前预付款比率过低，停止建仓, CurrentMarginLevel=", DoubleToString(CurrentMarginLevel * 100, 2), "%"
+         , ", CurrentLongAppendLot=", DoubleToString(CurrentLongAppendLot + CurrentLongTrendLot, 2), ", lotSize=", DoubleToString(lotSize, 2)
+      );
+      return;
+   }
+
+   if (orderType == OP_BUY){
+      return;
+   }
+
+
+   if (orderType == OP_SELL){
+      double bid = Bid;
+      double stopLoss = 0.0;
+      if (stopLossPoint > 0){
+         stopLoss = bid + stopLossPoint * PointValue;
+      }
+      //Print("Open sell order, Price=", DoubleToString(bid, 2));
+      int ticket = OrderSend(Symbol(), OP_SELL, lotSize, bid, SlippagePoints, stopLoss, 0, comment, 0, 0, clrRed);
+      if(ticket < 0) {
+         Print("OrderSend error #", GetLastError());
+         return;
+      }
+      if (comment == "AppendOrder"){
+         if (OpenShortOrderIndex == 0){
+            FirstOpenShortOrderPrice = bid;
+            FirstOpenShortOrderTime = TimeCurrent();
+         }
+         LastOpenShortOrderTime = iTime(NULL, BaseTimeFrame, 0);
+         LastOpenShortOrderPrice = bid;
+         OpenShortOrderIndex++;
+         LastOpenShortLotSize = lotSize;
+      }
+   }
+   else if (orderType == OP_BUY){
+      double ask = Ask;
+      double stopLoss = 0.0;
+      if (stopLossPoint > 0){
+         stopLoss = ask - stopLossPoint * PointValue;
+      }
+      //Print("Open buy order, Price=", DoubleToString(ask, 2));
+      int ticket = OrderSend(Symbol(), OP_BUY, lotSize, ask, SlippagePoints, stopLoss, 0, comment, 0, 0, clrGreen);
+      if(ticket < 0) {
+         Print("OrderSend error #", GetLastError(), ", lotSize=", DoubleToString(lotSize, 3));
+         return;
+      }
+      if (comment == "AppendOrder"){
+         if (OpenLongOrderIndex == 0){
+            FirstOpenLongOrderPrice = ask;
+            FirstOpenLongOrderTime = TimeCurrent();
+         }
+         LastOpenLongOrderTime = iTime(NULL, BaseTimeFrame, 0);
+         LastOpenLongOrderPrice = ask;
+         OpenLongOrderIndex++;
+         LastOpenLongLotSize = lotSize;
+      }else if(comment == "TrendOrder"){
+         LastLongTrendOrderTime = iTime(NULL, TrendTimeFrame, 0);
+         LastLongTrendOrderPrice = ask;
+         LastLongTrendLotSize = lotSize;
+      }
+
+   }
+
+}
+
+// 检查平仓信号并下单
+void CheckAndCloseOrder(int orderType, string comment, bool onlyWin, bool refreshOrderInfo, bool onlyExpires, double stopLossPoint){
+   double totleLot = 0;
+   if (orderType == OP_SELL){
+      if (comment == NULL){
+         totleLot = CurrentShortAppendLot + 0;
+      }else if (comment == "TrendOrder"){
+         totleLot = 0;
+      }else if (comment == "AppendOrder"){
+         totleLot = CurrentShortAppendLot;
+      }
+   }else if(orderType == OP_BUY){
+      if (comment == NULL){
+         totleLot = CurrentLongTrendLot + CurrentLongAppendLot;
+      }else if (comment == "TrendOrder"){
+         totleLot = CurrentLongTrendLot;
+      }else if (comment == "AppendOrder"){
+         totleLot = CurrentLongAppendLot;
+      }
+   }
+
+
+   // 平空仓
+   if (orderType == OP_SELL && CurrentShortAppendLot > 0){
+      for(int i = OrdersTotal() - 1; i >= 0; i--){
+         if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES)){
+            if(OrderSymbol() == Symbol() && OrderType() == OP_SELL){
+               double orderLot = OrderLots();
+               double orderProfit = OrderProfit();
+               double orderOpenPrice = OrderOpenPrice();
+               double profitThreshold = orderLot / LotSize * MiniProfit;
+               if (onlyWin && orderProfit < profitThreshold){
+                  continue;
+               }
+               if (onlyExpires){
+                  // 平仓过期的订单
+                  double holdTime = CalculateWorkdayHoldTime(OrderOpenTime());
+                  double holdHours = holdTime / 3600.0; // 转换为小时
+                  if (holdHours < MaxHoldHours){
+                     continue;
+                  }
+               }
+
+               if (stopLossPoint > 0){
+                  // 止损超涨仓位
+                  if (orderOpenPrice - Ask >= stopLossPoint * PointValue){
+                     Print("止损时价格差：", DoubleToString(orderOpenPrice - Ask, 2));
+                     OrderClose(OrderTicket(), orderLot, Ask, SlippagePoints, clrRed);
+                  }
+               }
+
+               if (stopLossPoint <= 0){
+                  // 正常平仓
+                  string comment1 = OrderComment();
+                  if (comment == NULL){
+                     OrderClose(OrderTicket(), orderLot, Ask, SlippagePoints, clrRed);
+                  }else if (comment == comment1){
+                     OrderClose(OrderTicket(), orderLot, Ask, SlippagePoints, clrRed);
+                  }
+               }
+
+            }
+         }
+      }
+
+      if (refreshOrderInfo){
+         if (comment == NULL){
+            LastOpenShortLotSize = 0;
+            OpenShortOrderIndex = 0;
+            FirstOpenShortOrderPrice = 0;
+            FirstOpenShortOrderTime = 0;
+            LastOpenShortOrderPrice = 0;
+         }else if (comment == "AppendOrder"){
+            LastOpenShortLotSize = 0;
+            OpenShortOrderIndex = 0;
+            FirstOpenShortOrderPrice = 0;
+            FirstOpenShortOrderTime = 0;
+            LastOpenShortOrderPrice = 0;
+            LastOpenShortOrderTime = 0;
+         }else if(comment == "TrendOrder"){
+         }
+
+      }
+   }
+
+   // 平多仓
+   if (orderType == OP_BUY && totleLot > 0){
+      for(int i = OrdersTotal() - 1; i >= 0; i--){
+         if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES)){
+            if(OrderSymbol() == Symbol() && OrderType() == OP_BUY){
+               double orderLot = OrderLots();
+               double orderProfit = OrderProfit();
+               double orderOpenPrice = OrderOpenPrice();
+               double profitThreshold = orderLot / LotSize * MiniProfit;
+               if (onlyWin && orderProfit < profitThreshold){
+                  continue;
+               }
+               if (onlyExpires){
+                  // 平仓过期的订单
+                  double holdTime = CalculateWorkdayHoldTime(OrderOpenTime());
+                  double holdHours = holdTime / 3600.0; // 转换为小时
+                  if (holdHours < MaxHoldHours){
+                     continue;
+                  }
+               }
+
+               if (stopLossPoint > 0){
+                  // 止损超跌仓位
+                  if (orderOpenPrice - Bid >= stopLossPoint * PointValue){
+                     Print("止损时价格差：", DoubleToString(orderOpenPrice - Bid, 2));
+                     OrderClose(OrderTicket(), orderLot, Bid, SlippagePoints, clrGreen);
+                  }
+               }
+
+               if (stopLossPoint <= 0){
+                  // 正常平仓
+                  string comment1 = OrderComment();
+                  if (comment == NULL){
+                     OrderClose(OrderTicket(), orderLot, Bid, SlippagePoints, clrGreen);
+                  }else if (comment == comment1){
+                     OrderClose(OrderTicket(), orderLot, Bid, SlippagePoints, clrGreen);
+                  }
+               }
+
+            }
+         }
+      }
+
+      if (refreshOrderInfo){
+         if (comment == NULL){
+            LastOpenLongLotSize = 0;
+            OpenLongOrderIndex = 0;
+            FirstOpenLongOrderPrice = 0;
+            FirstOpenLongOrderTime = 0;
+            LastOpenLongOrderPrice = 0;
+            LastLongTrendOrderTime = 0;
+            LastLongTrendOrderPrice = 0;
+            LastLongTrendLotSize = 0;
+         }else if (comment == "AppendOrder"){
+            LastOpenLongLotSize = 0;
+            OpenLongOrderIndex = 0;
+            FirstOpenLongOrderPrice = 0;
+            FirstOpenLongOrderTime = 0;
+            LastOpenLongOrderPrice = 0;
+            LastOpenLongOrderTime = 0;
+         }else if(comment == "TrendOrder"){
+            LastLongTrendOrderTime = 0;
+            LastLongTrendOrderPrice = 0;
+            LastLongTrendLotSize = 0;
+         }
+
+      }
+
+   }
+
+
+}
+
+
+// 基于均值回归策略判断是否开仓或平仓
+void MAReversionSignal(){
+
+   // 布林通道中轨价格
+   double centreBand = iMA(NULL, BaseTimeFrame, BBPeriod, 0, MODE_SMA, PRICE_CLOSE, 0);
+   // 使用M1的价格
+   double currentClosePrice = iClose(NULL, BaseTimeFrame, 1);
+   // 当前价格与BollingBand中轨的点差
+   double currentPointSpread = MathAbs(centreBand - currentClosePrice) / PointValue;
+
+   // 趋势周期RSI指标
+   double trendRSI = iRSI(NULL, TrendTimeFrame, RSIPeriod, PRICE_CLOSE, 1);
+   // 当前短线周期RSI
+   double currentRSI = iRSI(NULL, BaseTimeFrame, RSIPeriod, PRICE_CLOSE, 1);
+
+   // 当前价格与最后一单增量多单的点差
+   double openLongOrderPointSpread = (LastOpenLongOrderPrice - currentClosePrice) / PointValue;
+   // 当前价格与最后一单趋势多单的点差
+   double longTrendOrderPointSpread = (LastLongTrendOrderPrice - currentClosePrice) / PointValue;
+
+   // 当前价格与第一单增量多单的点差
+   double firstOrderPointSpread = (FirstOpenLongOrderPrice - currentClosePrice) / PointValue;
+
+   // 当前时间与短周期订单时间差
+   int openLongOrderTimeSpread = (int) (iTime(NULL, BaseTimeFrame, 0) - LastOpenLongOrderTime);
+   // 当前时间与第一个订单时间差
+   int firstOrderTimeSpread = (int) (iTime(NULL, BaseTimeFrame, 0) - FirstOpenLongOrderTime);
+
+   // 多仓利润阈值
+   double longProfitMaxThreshold = CalculateProfitThreshold(OP_BUY, MaxProfit);
+   double longProfitMiniThreshold = CalculateProfitThreshold(OP_BUY, MiniProfit);
+   // 多仓当前总利润
+   double longTotleProfit = CurrentLongTrendProfit + CurrentLongAppendProfit;
+   // 多仓当前总仓位
+   double longTotleLot = CurrentLongTrendLot + CurrentLongAppendLot;
+
+
+   //-- 空头相关参数
+   // 当前时间与上一个短周期订单时间差
+   int openShortOrderTimeSpread = (int) (iTime(NULL, BaseTimeFrame, 0) - LastOpenShortOrderTime);
+   // 当前价格与最后一单增量多单的点差
+   double openShortOrderPointSpread = (currentClosePrice - LastOpenShortOrderPrice) / PointValue;
+
+
+   //Print("当前利润: ", DoubleToString(longTotleProfit, 2), ", 当前预付款比率: ", DoubleToString(CurrentMarginLevel * 100, 2), "%"
+   //      , ", 利润阈值MAX: ", DoubleToString(longProfitMaxThreshold, 2), ", 利润阈值Mini: ", DoubleToString(longProfitMiniThreshold, 2)
+   //   );
+
+   // 趋势超涨
+   if (LastTrendBBPos >= 3){
+      if ((trendRSI >= 70 && CurrentBaseBBPos >= 3)
+         || (CurrentLongAppendLot > TotalMaxLot && CurrentLongAppendProfitRatio < -0.1
+            && (CurrentBaseBBPos >= 2 || currentRSI >= 70))
+      ){
+         // 平掉所有增量多仓
+         CheckAndCloseOrder(OP_BUY, "AppendOrder", False, True, False, 0);
+         Print("趋势超涨，平掉所有增量多仓，CurrentLongAppendLot=", DoubleToString(CurrentLongAppendLot, 2), ", CurrentMarginLevel=", DoubleToString(CurrentMarginLevel, 2));
+      }else if (CurrentLongAppendProfit > longProfitMaxThreshold){
+         CheckAndCloseOrder(OP_BUY, "AppendOrder", False, True, False, 0);
+         Print("趋势超涨，利润达标，平掉所有增量多仓，CurrentLongAppendLot=", DoubleToString(CurrentLongAppendLot, 2));
+      }
+
+      // 创建空仓
+      if (openShortOrderTimeSpread > OrderTimeSpreadThreshold
+         && openShortOrderPointSpread >= 500
+         && (CurrentBaseBBPos >= 3 || currentRSI >= 70)){
+         double currentLotSize = CalculateShortLotSize(firstOrderPointSpread);
+         CheckAndOpenOrder(OP_SELL, currentLotSize, 0, "AppendOrder");
+      }
+
+
+   // 趋势超跌
+   }else if (LastTrendBBPos <= -3){
+      //止盈多仓
+      if (CurrentLongAppendProfit > longProfitMaxThreshold
+         || (CurrentLongAppendLot > TotalMaxLot && CurrentLongAppendProfit > longProfitMiniThreshold)
+         || (CurrentLongAppendLot > TotalMaxLot && CurrentBaseBBPos >= 3 && CurrentLongAppendProfit > 0)
+      ){
+         CheckAndCloseOrder(OP_BUY, "AppendOrder", False, True, False, 0);
+         Print("趋势超跌，利润达标或仓位过大，止盈，CurrentLongAppendLot=", DoubleToString(CurrentLongAppendLot, 2));
+      }
+
+      //止盈空仓
+      if (CurrentShortAppendLot > 0 && CurrentBaseBBPos <= -3 && currentRSI <= 30){
+         CheckAndCloseOrder(OP_SELL, "AppendOrder", False, True, False, 0);
+      }
+
+
+      // 当前无多头仓位
+      if (CurrentLongAppendLot == 0){
+         // 下穿下轨
+         if (CurrentBaseBBPos <= -3 || (CurrentBaseBBPos <= -1 && currentPointSpread >= MiniMASpread)){
+            //double currentLotSize = CalculateLotSize_1(OP_BUY);
+            double currentLotSize = CalculateLotSize_2(OP_BUY, firstOrderPointSpread);
+            CheckAndOpenOrder(OP_BUY, currentLotSize, 0, "AppendOrder");
+            Print("趋势超跌，下穿下轨，增加增量多仓，LastOpenLongLotSize=", DoubleToString(LastOpenLongLotSize, 2));
+         }
+      }else{
+         double currentMASpread = CalculateMASpread_2(OpenLongOrderIndex, firstOrderPointSpread);
+         if (openLongOrderPointSpread >= currentMASpread && openLongOrderTimeSpread >= OrderTimeSpreadThreshold
+            && (CurrentBaseBBPos <= -3 || currentRSI <= 30)
+         ){
+            //double currentLotSize = CalculateLotSize_1(OP_BUY);
+            double currentLotSize = CalculateLotSize_2(OP_BUY, firstOrderPointSpread);
+            CheckAndOpenOrder(OP_BUY, currentLotSize, 0, "AppendOrder");
+            Print("趋势超跌，持续下跌，增加增量多仓，LastOpenLongLotSize=", DoubleToString(LastOpenLongLotSize, 2)
+               , ", OpenLongOrderIndex=", OpenLongOrderIndex-1, ", firstOrderPointSpread=", DoubleToString(firstOrderPointSpread, 2)
+               , ", openLongOrderPointSpread=", DoubleToString(openLongOrderPointSpread, 2), ", currentMASpread=", DoubleToString(currentMASpread, 2)
+               , ", openLongOrderTimeSpread=", DoubleToString(openLongOrderTimeSpread, 2)
+            );
+         }
+      }
+
+   }else{
+      if (CurrentLongAppendProfit > longProfitMaxThreshold
+         || (CurrentLongAppendLot > TotalMaxLot && CurrentLongAppendProfit > longProfitMiniThreshold)
+         || (CurrentLongAppendLot > TotalMaxLot && CurrentBaseBBPos >= 3 && CurrentLongAppendProfit > 0)
+         //|| (CurrentLongAppendLot > TotalMaxLot && firstOrderTimeSpread > 24*60*60 && LastTrendBBPos >= 2 && CurrentBaseBBPos >= 3)
+      ){
+         CheckAndCloseOrder(OP_BUY, NULL, False, True, False, 0);
+         Print("利润达标，平掉所有增量多仓，CurrentLongAppendProfit=", DoubleToString(CurrentLongAppendProfit, 2));
+      }
+
+      // 中轨上方
+      if (CurrentBaseBBPos > 1){
+         // 当前存在多头仓位，尝试做空
+         if (CurrentLongAppendLot > 0 && LastOpenLongOrderPrice > currentClosePrice
+             && (CurrentBaseBBPos >= 3 || currentRSI >= 70)
+         ){
+            //double currentLotSize = CalculateLotSize_2(OP_SELL, firstOrderPointSpread);
+            CheckAndOpenOrder(OP_SELL, LotSize, 0, "AppendOrder");
+         }
+
+      // 中轨下方
+      }else if (CurrentBaseBBPos < -1){
+         double currentMASpread = CalculateMASpread_2(OpenLongOrderIndex, firstOrderPointSpread);
+         // 当前无多头仓位
+         if (CurrentLongAppendLot == 0){
+            // 下穿下轨
+            if (CurrentBaseBBPos <= -3 || currentPointSpread >= BaseMASpread){
+               //double currentLotSize = CalculateLotSize_1(OP_BUY);
+               double currentLotSize = CalculateLotSize_2(OP_BUY, firstOrderPointSpread);
+               CheckAndOpenOrder(OP_BUY, currentLotSize, 0, "AppendOrder");
+               Print("下穿下轨，增加增量多仓，CurrentLongAppendLot=", DoubleToString(CurrentLongAppendLot, 2));
+            }
+         }else{
+            if (openLongOrderPointSpread >= currentMASpread && openLongOrderTimeSpread >= OrderTimeSpreadThreshold
+               && (CurrentBaseBBPos <= -3 || currentRSI <= 30)
+            ){
+               //double currentLotSize = CalculateLotSize_1(OP_BUY);
+               double currentLotSize = CalculateLotSize_2(OP_BUY, firstOrderPointSpread);
+               CheckAndOpenOrder(OP_BUY, currentLotSize, 0, "AppendOrder");
+               Print("持续下跌，增加增量多仓，CurrentLongAppendLot=", DoubleToString(CurrentLongAppendLot, 2)
+                  , ", OpenLongOrderIndex=", OpenLongOrderIndex-1, ", firstOrderPointSpread=", DoubleToString(firstOrderPointSpread, 2)
+                  , ", openLongOrderPointSpread=", DoubleToString(openLongOrderPointSpread, 2), ", currentMASpread=", DoubleToString(currentMASpread, 2)
+                  , ", openLongOrderTimeSpread=", DoubleToString(openLongOrderTimeSpread, 2)
+               );
+            }
+         }
+
+         //止盈空仓
+         if (CurrentShortAppendLot > 0 && CurrentBaseBBPos <= -3 && currentRSI <= 30){
+            CheckAndCloseOrder(OP_SELL, "AppendOrder", False, True, False, 0);
+         }
+      }
+
+   }
+
+   // 追踪止损
+   //TrailingStopLoss(OP_BUY, "TrendOrder");
+}
+
+// 追踪止损
+void TrailingStopLoss(int orderType, string comment){
+   int ordersTotal = OrdersTotal();
+   if (ordersTotal > 0){
+      for(int i = ordersTotal - 1; i >= 0; i--){
+         if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES)){
+            if(OrderSymbol() == Symbol() && OrderType() == orderType){
+               double orderLot = OrderLots();
+               double orderProfit = OrderProfit();
+               double orderOpenPrice = OrderOpenPrice();
+               double orderStopLoss = OrderStopLoss();
+               string comment1 = OrderComment();
+
+               if (orderType == OP_SELL && comment1 == comment){
+                  double currentPrice = Ask;
+
+
+               }else if (orderType == OP_BUY && comment1 == comment){
+                  double currentPrice = Bid;
+                  // 当前价格大于开仓价，订单开始盈利
+                  if (currentPrice > orderOpenPrice){
+                     if (((int)orderOpenPrice) > ((int)orderStopLoss)){
+                        // 开仓价格大于止损价
+                        if (currentPrice - orderOpenPrice > orderOpenPrice - orderStopLoss){
+                           // 当前价格与开仓价的差价大于初次止损阈值，更新止损价为开仓价
+                           Print("当前价格与开仓价的差价大于初次止损阈值, orderOpenPrice=", DoubleToString(orderOpenPrice, 2), " ,orderStopLoss=", DoubleToString(orderStopLoss, 2));
+                           bool res = OrderModify(OrderTicket(), orderOpenPrice, orderOpenPrice, 0, clrGreen);
+                           if (!res){
+                              Print("Error in OrderModify, orderType=", orderType, " , Error code=", GetLastError());
+                           }
+                        }
+                     }else{
+                        //double stopLossSpread = MiniStopLossPoints * PointValue * 4;
+                        //// 止损价大于开仓价，说明订单已大幅盈利
+                        //if (currentPrice - orderStopLoss > stopLossSpread){
+                        //   // 当前价格与止损价的差价大于止损阈值，更新止损价
+                        //   Print("当前价格与止损价的差价大于止损阈值, currentPrice - orderStopLoss=", DoubleToString(currentPrice - orderStopLoss, 2));
+                        //   double newStopLoss = currentPrice - stopLossSpread;
+                        //   bool res = OrderModify(OrderTicket(), orderOpenPrice, newStopLoss, 0, clrGreen);
+                        //   if (!res){
+                        //      Print("Error in OrderModify, orderType=", orderType, " , Error code=", GetLastError());
+                        //   }
+                        //}
+
+                     }
+
+                  }
+
+               }
+
+
+
+            }
+         }
+      }
+
+   }
+
+
+}
+
+
+// 更新BollingBand信号
+void RefreshBollingBandSignal(){
+   CurrentBaseBBPos = BollingBandSignal(BaseTimeFrame, 0);
+   CurrentTrendBBPos = BollingBandSignal(TrendTimeFrame, 0);
+   LastTrendBBPos = BollingBandSignal(TrendTimeFrame, 1);
+   if (LastTrendBBPos >= 3){
+      CurrentTrendDirect = -1;
+      //Print("趋势方向改变，CurrentTrendDirect=", CurrentTrendDirect, ", LastTrendBBPos=", LastTrendBBPos);
+   }else if (LastTrendBBPos <= -3){
+      CurrentTrendDirect = 1;
+      //Print("趋势方向改变，CurrentTrendDirect=", CurrentTrendDirect, ", LastTrendBBPos=", LastTrendBBPos);
+   }
+}
+
+//-- BollingBand信号
+int BollingBandSignal(int timeFrame, int index){
+   int bBSignal = 0;
+   // 布林通道中轨价格
+   double centreBand = iMA(NULL, timeFrame, BBPeriod, 0, MODE_SMA, PRICE_CLOSE, index);
+   //计算标准差
+   double std = iStdDev(NULL, timeFrame, BBPeriod, 0, MODE_SMA, PRICE_CLOSE, index);
+   //布林通道上下轨
+   upperBand = centreBand + BBDeviation * std;
+   lowerBand = centreBand - BBDeviation * std;
+   // 使用M1的价格
+   double currentOpenPrice = iOpen(NULL, timeFrame, index);
+   double currentClosePrice = iClose(NULL, timeFrame, index);
+   double currentHighPrice = iHigh(NULL, timeFrame, index);
+   double currentLowPrice = iLow(NULL, timeFrame, index);
+   if (currentOpenPrice < centreBand && centreBand < currentClosePrice){
+      //价格上穿中轨
+      bBSignal = 1;
+   }
+   if (currentOpenPrice > centreBand && centreBand > currentClosePrice){
+      //价格下穿中轨
+      bBSignal = -1;
+   }
+   if (currentOpenPrice > centreBand && centreBand < currentClosePrice
+      && currentOpenPrice < upperBand && upperBand > currentClosePrice
+   ) {
+      // K线位于中轨上方
+      bBSignal = 2;
+      //Print("CurrentBaseBBPos == 2, upperBand=", DoubleToString(upperBand, 2), "currentHighPrice=", DoubleToString(currentHighPrice, 2));
+   }
+   if (currentOpenPrice < centreBand && centreBand > currentClosePrice
+      && currentOpenPrice > lowerBand && lowerBand < currentClosePrice) {
+      // K线位于中轨下方
+      bBSignal = -2;
+      //Print("CurrentBaseBBPos == -2, lowerBand=", DoubleToString(lowerBand, 2), "currentLowPrice=", DoubleToString(currentLowPrice, 2));
+   }
+   if (lowerBand > currentLowPrice) {
+      //价格下穿下轨
+      bBSignal = -3;
+      //Print("CurrentBaseBBPos == -3, lowerBand=", DoubleToString(lowerBand, 2), "currentLowPrice=", DoubleToString(currentLowPrice, 2));
+   }
+   if (upperBand < currentHighPrice) {
+      //价格上穿上轨
+      bBSignal = 3;
+      //Print("CurrentBaseBBPos == 3, upperBand=", DoubleToString(upperBand, 2), "currentHighPrice=", DoubleToString(currentHighPrice, 2));
+   }
+   //else{
+   //   //未知
+   //   bBSignal = 0;
+   //}
+
+   return bBSignal;
+}
+
+
+
+// 更新当前持仓量
+void RefreshPosition(){
+   CurrentLongTrendLot = 0;
+   CurrentLongTrendProfit = 0;
+   CurrentLongAppendLot = 0;
+   CurrentLongAppendProfit = 0;
+   CurrentShortAppendLot = 0;
+   CurrentShortAppendProfit = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--){
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+     {
+      if(OrderSymbol() == Symbol())
+        {
+         // 更新持仓量及利润
+         double orderLot = OrderLots();
+         double profit = OrderProfit();
+         string comment = OrderComment();
+         if(OrderType() == OP_BUY){
+            if (comment == "TrendOrder"){
+               CurrentLongTrendLot = CurrentLongTrendLot + orderLot;
+               CurrentLongTrendProfit = CurrentLongTrendProfit + profit;
+            }else if (comment == "AppendOrder"){
+               CurrentLongAppendLot = CurrentLongAppendLot + orderLot;
+               CurrentLongAppendProfit = CurrentLongAppendProfit + profit;
+               if (LastOpenLongOrderPrice == -1){
+                  LastOpenLongOrderPrice = OrderOpenPrice();
+                  LastOpenLongLotSize = orderLot;
+               }
+            }
+
+
+         }else if(OrderType() == OP_SELL){
+            if (comment == "TrendOrder"){
+               //
+            }else if (comment == "AppendOrder"){
+               CurrentShortAppendLot = CurrentShortAppendLot + orderLot;
+               CurrentShortAppendProfit = CurrentShortAppendProfit + profit;
+               if (LastOpenShortOrderPrice == -1){
+                  LastOpenShortOrderPrice = OrderOpenPrice();
+                  LastOpenShortLotSize = orderLot;
+               }
+            }
+         }
+        }
+     }
+  }
+
+  // 更新利润率
+  CurrentLongAppendProfitRatio = CurrentLongAppendProfit / InitialCapital;
+  CurrentLongTrendProfitRatio = CurrentLongTrendProfit / InitialCapital;
+  CurrentShortAppendProfitRatio = CurrentShortAppendProfit / InitialCapital;
+
+}
+
+// 计算单侧订单总利润最小阈值
+double CalculateProfitThreshold(int orderType, double baseProfit){
+   double orderIndex = 0;
+   if (orderType == OP_BUY){
+      orderIndex = OpenLongOrderIndex;
+   }else if(OrderType() == OP_SELL){
+      orderIndex = OpenShortOrderIndex;
+   }
+   double profitThreshold = baseProfit * CurrentLongAppendLot / (LotSize) / (FibonacciValue(orderIndex, 0.1, LotSizeFibonacciMaxIndex) + 1);
+
+   return profitThreshold;
+}
+
+
+
+// 计算当前订单交易手数，基于斐波拉契数列
+double CalculateLotSize(int orderType){
+   double tempLotSize = LotSize;
+   int orderIndex = 0;
+   double lastOrderLotSize = 0;
+   if (orderType == OP_BUY){
+      orderIndex = OpenLongOrderIndex;
+      lastOrderLotSize = LastOpenLongLotSize;
+   } else if(orderType == OP_SELL){
+      orderIndex = OpenShortOrderIndex;
+      lastOrderLotSize = LastOpenShortLotSize;
+   }
+
+   //if (lastOrderLotSize > 0){
+   //   tempLotSize = NormalizeDouble(lastOrderLotSize * 1.4 * LotSize, LotPrecision);
+   //}
+
+   if (orderIndex > 1){
+      tempLotSize = FibonacciValue(orderIndex - 1, LotSize, LotSizeFibonacciMaxIndex);
+      //tempLotSize = NormalizeDouble((lastOrderLotSize + LotSize) * 1.4, LotPrecision);
+   }
+
+   return tempLotSize;
+}
+
+// 计算当前订单交易手数，基于倍数
+double CalculateLotSize_1(int orderType){
+   int orderIndex = 0;
+   double lastOrderLotSize = 0;
+   if (orderType == OP_BUY){
+      orderIndex = OpenLongOrderIndex;
+      lastOrderLotSize = LastOpenLongLotSize;
+   } else if(orderType == OP_SELL){
+      orderIndex = OpenShortOrderIndex;
+      lastOrderLotSize = LastOpenShortLotSize;
+   }
+
+   double tempLotSize = LotSize;
+   if (orderIndex < 2){
+      tempLotSize = LotSize;
+   }else if (orderIndex < 4){
+      tempLotSize = orderIndex * LotSize;
+   }else {
+      if (CurrentMarginLevel > 100){
+         tempLotSize = NormalizeDouble(lastOrderLotSize * MartinFactor, LotPrecision);
+      }else if (CurrentMarginLevel > 50 && CurrentMarginLevel < 100){
+         tempLotSize = NormalizeDouble(lastOrderLotSize + LotSize, LotPrecision);
+      }else{
+         tempLotSize = orderIndex * LotSize;
+      }
+   }
+
+   double maxLotSize = MaxLotSizeFactor * LotSize;
+   if (tempLotSize > maxLotSize){
+      tempLotSize = maxLotSize;
+   }
+
+   return tempLotSize;
+
+}
+
+// 计算当前订单交易手数，基于价格差等
+double CalculateLotSize_2(int orderType, double firstOrderPointSpread){
+   int orderIndex = 0;
+   double lastOrderLotSize = 0;
+   if (orderType == OP_BUY){
+      orderIndex = OpenLongOrderIndex;
+      lastOrderLotSize = LastOpenLongLotSize;
+   } else if(orderType == OP_SELL){
+      orderIndex = OpenShortOrderIndex;
+      lastOrderLotSize = LastOpenShortLotSize;
+   }
+
+   double tempLotSize = LotSize;
+   if (lastOrderLotSize > 0){
+      tempLotSize = lastOrderLotSize;
+   }
+
+   if (orderIndex <= 1){
+      tempLotSize = LotSize;
+      //Print("orderIndex <= 2");
+   }else if (orderIndex <= 3){
+      if (firstOrderPointSpread > 1000){
+         tempLotSize = 2 * LotSize;
+         //Print("orderIndex <= 4, firstOrderPointSpread > 1000");
+      }else{
+         //Print("orderIndex <= 4, firstOrderPointSpread < 1000");
+         tempLotSize = 1 * LotSize;
+      }
+   }else {
+      if (firstOrderPointSpread > 1000 && firstOrderPointSpread <= 2000){
+         //Print("firstOrderPointSpread > 1000 && firstOrderPointSpread <= 2000");
+         tempLotSize = 2 * LotSize;
+      }else if (firstOrderPointSpread > 2000 && firstOrderPointSpread <= 3000){
+         //Print("firstOrderPointSpread > 2000 && firstOrderPointSpread <= 3000");
+         if (CurrentMarginLevel > 50){
+            //Print("CurrentMarginLevel > 50");
+            tempLotSize = 3 * LotSize;
+         }else if (CurrentMarginLevel > 10 && CurrentMarginLevel < 50){
+            //Print("CurrentMarginLevel > 10 && CurrentMarginLevel < 50");
+            tempLotSize = 2 * LotSize;
+         }
+      }else if (firstOrderPointSpread > 3000 && firstOrderPointSpread <= 5000){
+         //Print("firstOrderPointSpread > 2000 && firstOrderPointSpread <= 3000");
+         if (CurrentMarginLevel > 50){
+            //Print("CurrentMarginLevel > 50");
+            tempLotSize = 4 * LotSize;
+         }else if (CurrentMarginLevel > 10 && CurrentMarginLevel < 50){
+            //Print("CurrentMarginLevel > 10 && CurrentMarginLevel < 50");
+            tempLotSize = 3 * LotSize;
+         }
+      }else if (firstOrderPointSpread > 5000 && firstOrderPointSpread <= 8000){
+         //Print("firstOrderPointSpread > 5000 && firstOrderPointSpread <= 8000");
+         if (CurrentMarginLevel > 50){
+            //Print("CurrentMarginLevel > 50");
+            tempLotSize = 5 * LotSize;
+         }else if (CurrentMarginLevel > 10 && CurrentMarginLevel < 50){
+            //Print("CurrentMarginLevel > 10 && CurrentMarginLevel < 50");
+            tempLotSize = 4 * LotSize;
+         }
+      }else if (firstOrderPointSpread > 8000 && firstOrderPointSpread <= 13000){
+         //Print("firstOrderPointSpread > 8000 && firstOrderPointSpread <= 13000");
+         if (CurrentMarginLevel > 50){
+            //Print("CurrentMarginLevel > 50");
+            tempLotSize = 6 * LotSize;
+         }else if (CurrentMarginLevel > 10 && CurrentMarginLevel < 50){
+            //Print("CurrentMarginLevel > 10 && CurrentMarginLevel < 50");
+            tempLotSize = 5 * LotSize;
+         }
+      }else if (firstOrderPointSpread > 13000 && firstOrderPointSpread <= 21000){
+         //Print("firstOrderPointSpread > 13000 && firstOrderPointSpread <= 21000");
+         if (CurrentMarginLevel > 50){
+            //Print("CurrentMarginLevel > 50");
+            tempLotSize = 7 * LotSize;
+         }else if (CurrentMarginLevel > 10 && CurrentMarginLevel < 50){
+            //Print("CurrentMarginLevel > 10 && CurrentMarginLevel < 50");
+            tempLotSize = 6 * LotSize;
+         }
+      }else if (firstOrderPointSpread > 21000){
+         //Print("firstOrderPointSpread > 21000");
+         if (CurrentMarginLevel > 50){
+            //Print("CurrentMarginLevel > 50");
+            tempLotSize = 8 * LotSize;
+         }else if (CurrentMarginLevel > 10 && CurrentMarginLevel < 50){
+            //Print("CurrentMarginLevel > 10 && CurrentMarginLevel < 50");
+            tempLotSize = 7 * LotSize;
+         }
+      }
+   }
+
+   double maxLotSize = MaxLotSizeFactor * LotSize;
+   if (tempLotSize > maxLotSize){
+      tempLotSize = maxLotSize;
+   }
+
+   //double currentPrice = iClose(NULL, BaseTimeFrame, 1);
+   //double pricePointSpread = (FirstOpenLongOrderPrice - currentPrice) / PointValue;
+   //Print("FirstOpenLongOrderPrice=", DoubleToString(FirstOpenLongOrderPrice, 2), ", currentPrice=", DoubleToString(currentPrice, 2), ", pricePointSpread=", DoubleToString(pricePointSpread, 2));
+   Print("orderIndex=", orderIndex, ", firstOrderPointSpread=", DoubleToString(firstOrderPointSpread, 2)
+   , ", lastOrderLotSize=", DoubleToString(lastOrderLotSize, 2), ", tempLotSize=", DoubleToString(tempLotSize, 2));
+
+   return tempLotSize;
+
+}
+
+// 计算空头当前订单交易手数，基于价格差等
+double CalculateShortLotSize(double firstOrderPointSpread){
+   int orderIndex = OpenShortOrderIndex;
+   double lastOrderLotSize = LastOpenShortLotSize;
+
+   double tempLotSize = LotSize;
+   if (lastOrderLotSize > 0){
+      tempLotSize = lastOrderLotSize;
+   }
+
+   if (orderIndex <= 1){
+      tempLotSize = LotSize;
+   }else if (orderIndex <= 3){
+      tempLotSize = 1 * LotSize;
+   }else {
+      if (firstOrderPointSpread > 1000 && firstOrderPointSpread <= 2000){
+         //Print("firstOrderPointSpread > 1000 && firstOrderPointSpread <= 2000");
+         tempLotSize = 2 * LotSize;
+      }else if (firstOrderPointSpread > 2000 && firstOrderPointSpread <= 3000){
+         //Print("firstOrderPointSpread > 2000 && firstOrderPointSpread <= 3000");
+         tempLotSize = 3 * LotSize;
+      }else if (firstOrderPointSpread > 3000 && firstOrderPointSpread <= 5000){
+         //Print("firstOrderPointSpread > 2000 && firstOrderPointSpread <= 3000");
+         tempLotSize = 4 * LotSize;
+      }else if (firstOrderPointSpread > 5000 && firstOrderPointSpread <= 8000){
+         //Print("firstOrderPointSpread > 5000 && firstOrderPointSpread <= 8000");
+         tempLotSize = 5 * LotSize;
+      }else if (firstOrderPointSpread > 8000 && firstOrderPointSpread <= 13000){
+         //Print("firstOrderPointSpread > 8000 && firstOrderPointSpread <= 13000");
+         tempLotSize = 6 * LotSize;
+      }else if (firstOrderPointSpread > 13000 && firstOrderPointSpread <= 21000){
+         //Print("firstOrderPointSpread > 13000 && firstOrderPointSpread <= 21000");
+         tempLotSize = 7 * LotSize;
+      }else if (firstOrderPointSpread > 21000){
+         //Print("firstOrderPointSpread > 21000");
+         tempLotSize = 8 * LotSize;
+      }
+   }
+
+   double maxLotSize = MaxLotSizeFactor * LotSize;
+   if (tempLotSize > maxLotSize){
+      tempLotSize = maxLotSize;
+   }
+
+   //Print("orderIndex=", orderIndex, ", firstOrderPointSpread=", DoubleToString(firstOrderPointSpread, 2)
+   //, ", lastOrderLotSize=", DoubleToString(lastOrderLotSize, 2), ", tempLotSize=", DoubleToString(tempLotSize, 2));
+
+   return tempLotSize;
+
+}
+
+// 计算当前趋势订单的止损点数
+double CalculateTrendStopLossPoint(int orderType, double firstOrderPointSpread){
+   double lastOrderLotSize = 0;
+   if (orderType == OP_BUY){
+      lastOrderLotSize = LastLongTrendLotSize;
+   } else if(orderType == OP_SELL){
+      // todo
+      return 0;
+   }
+
+   // 计算止损点数
+   double stopLossPoint = MiniStopLossPoints;
+
+   if (firstOrderPointSpread > 10000){
+      stopLossPoint = NormalizeDouble(stopLossPoint * 1, 0);
+
+   }else if(firstOrderPointSpread > 15000){
+      stopLossPoint = NormalizeDouble(stopLossPoint * 1.5 / PointValue, 0);
+
+   }else if(firstOrderPointSpread > 20000){
+      stopLossPoint = NormalizeDouble(stopLossPoint * 2 / PointValue, 0);
+
+   }else if(firstOrderPointSpread > 25000){
+      stopLossPoint = NormalizeDouble(stopLossPoint * 2.5 / PointValue, 0);
+   }
+
+   return stopLossPoint;
+}
+
+// 计算当前价格点差
+double CalculateMASpread(int orderIndex){
+   if (orderIndex < 3){
+      return BaseMASpread;
+   }
+
+   double currentMASpread = MaxMASpread / (FibonacciValue(orderIndex - 2, 0.1, MASpreadFibonacciMaxIndex) + 1);
+   if (currentMASpread < MiniMASpread){
+      currentMASpread = MiniMASpread;
+   }
+   return currentMASpread;
+}
+
+// 根据与第一单的距离计算当前价格点差
+double CalculateMASpread_2(int orderIndex, double firstOrderPointSpread){
+   double currentMASpread = BaseMASpread;
+   if (orderIndex < 1){
+      return currentMASpread;
+   }
+
+   if (firstOrderPointSpread <= 1000){
+      currentMASpread = MaxMASpread;
+
+   }else if (firstOrderPointSpread > 1000 && firstOrderPointSpread <= 2000){
+      if (orderIndex <= 2){
+         currentMASpread = MaxMASpread;
+      }else {
+         currentMASpread = MaxMASpread * 1.5;
+      }
+
+   }else if (firstOrderPointSpread > 2000 && firstOrderPointSpread <= 3000){
+      if (orderIndex <= 4){
+         currentMASpread = MaxMASpread * 1.5;
+      }else {
+         currentMASpread = MaxMASpread * 2;
+      }
+
+   }else if (firstOrderPointSpread > 3000 && firstOrderPointSpread <= 5000){
+      if (orderIndex <= 6){
+         currentMASpread = MaxMASpread * 2;
+      }else {
+         currentMASpread = MaxMASpread * 3;
+      }
+
+   }else if (firstOrderPointSpread > 5000 && firstOrderPointSpread <= 8000){
+      if (orderIndex <= 8){
+         currentMASpread = MaxMASpread * 3;
+      }else {
+         currentMASpread = MaxMASpread * 5;
+      }
+
+
+   }else if (firstOrderPointSpread > 8000 && firstOrderPointSpread <= 13000){
+      if (orderIndex <= 10){
+         currentMASpread = MaxMASpread * 5;
+      }else {
+         currentMASpread = MaxMASpread * 8;
+      }
+
+
+   }else if (firstOrderPointSpread > 13000 && firstOrderPointSpread <= 21000){
+      if (orderIndex <= 12){
+         currentMASpread = MaxMASpread * 8;
+      }else {
+         currentMASpread = MaxMASpread * 13;
+      }
+
+
+   }else if (firstOrderPointSpread > 21000){
+      if (orderIndex <= 15){
+         currentMASpread = MaxMASpread * 13;
+      }else {
+         currentMASpread = MaxMASpread * 21;
+      }
+
+   }
+   return currentMASpread;
+}
+
+
+// 计算斐波拉契数列的值
+double FibonacciValue(int index, double multiplier, int maxIndex){
+   double tempValue = 1.0 * multiplier;
+   double a = tempValue;
+   double b = tempValue + a;
+   if (index == 0){
+      tempValue = a;
+      return tempValue;
+   }
+   if (index == 1){
+      tempValue = b;
+      return tempValue;
+   }
+   double c;
+   for (int i = 1; i < maxIndex; i++){
+      c = a + b;
+      a = b;
+      b = c;
+      if (i == index){
+         tempValue = c;
+         return tempValue;
+      }
+   }
+   if (index >= maxIndex){
+      tempValue = c;
+      return tempValue;
+   }
+   return tempValue;
+}
+
+// 根据ATR刷新MA点差阈值
+void RefreshATRThreshold(){
+   //获取波动阈值
+   double atr = iATR(NULL, ATRTimeFrame, ATRPeriod, 1);
+   double atrThreshold = atr / PointValue;
+   if (atrThreshold > MaxMASpread){
+      atrThreshold = MaxMASpread;
+   }else if (atrThreshold < MiniMASpread){
+      atrThreshold = MiniMASpread;
+   }
+
+   MASpreadThreshold = atrThreshold;
+}
+
+//-- 计算数字的精度
+void GetPrecision(double value) {
+    // 将数字转换为字符串，保留足够位数
+    string strValue = DoubleToString(MathAbs(value), 8); // 保留 8 位小数，避免截断
+    int dotPos = StringFind(strValue, ".");
+
+    // 如果没有小数点，精度为 0
+    if (dotPos == -1){
+      LotPrecision = 0;
+      return;
+    }
+
+    // 统计小数点后的位数
+    int precision = StringLen(strValue) - dotPos - 1;
+
+    // 去除末尾的零
+    while (precision > 0 && StringGetChar(strValue, dotPos + precision) == '0') {
+        precision--;
+    }
+
+    LotPrecision = (precision > 0) ? precision : 0;
+}
+
+//-- 计算工作日持仓时间
+double CalculateWorkdayHoldTime(datetime openTime) {
+   datetime currentTime = TimeCurrent();
+   double totalSeconds = currentTime - openTime;
+   double workdaySeconds = totalSeconds;
+
+   // 遍历每一天，排除周末
+   datetime startTime = openTime;
+   while (startTime < currentTime) {
+      datetime nextDay = startTime + 86400; // 下一天 (86,400 秒)
+      int dayOfWeek = TimeDayOfWeek(startTime);
+      if (dayOfWeek == 6 || dayOfWeek == 0) { // 周六或周日
+         workdaySeconds -= 86400; // 减去周末一天
+      }
+      startTime = nextDay;
+   }
+
+   // 确保不小于0
+   if (workdaySeconds < 0) workdaySeconds = 0;
+   return workdaySeconds;
+}
+
+// 判断是否为重要经济数据发布的时间窗口
+bool IsInEventWindow() {
+   int day = Day();
+   int month = Month();
+   int year = Year();
+   int dayOfWeek = DayOfWeek();
+   datetime currentTime = TimeCurrent();
+
+   // CPI发布时间，每月第二个星期三，13:30(UTC+1)
+   if (dayOfWeek == 3 && day >= 7 && day < 14){
+      datetime eventTimeStart = StrToTime(StringFormat("%d.%02d.%02d 13:00", year, month, day));
+      datetime eventTimeEnd = StrToTime(StringFormat("%d.%02d.%02d 14:00", year, month, day));
+      if (eventTimeStart < currentTime && currentTime < eventTimeEnd){
+         return True;
+      }
+   }
+
+   // NFP发布时间，每月第一个星期五，13:30(UTC+1)
+   if (dayOfWeek == 5 && day >= 0 && day < 7){
+      datetime eventTimeStart = StrToTime(StringFormat("%d.%02d.%02d 13:00", year, month, day));
+      datetime eventTimeEnd = StrToTime(StringFormat("%d.%02d.%02d 14:00", year, month, day));
+      if (eventTimeStart < currentTime && currentTime < eventTimeEnd){
+         return True;
+      }
+   }
+
+   return False;
+}
+
+
+// 计算夏普率
+double CalculateSharpeRatio() {
+   int totalTrades = 0;
+   double totalProfit = 0.0;
+   double weeklyProfits[]; // 存储每周的收益
+   ArrayResize(weeklyProfits, INITIAL_ARRAY_SIZE);
+   double weeklyProfitRate[]; // 存储每周收益率
+   ArrayResize(weeklyProfitRate, INITIAL_ARRAY_SIZE);
+   datetime firstCloseTime = 0; // 第一笔订单的关闭时间
+   int totalWeeks = 0;   // 交易总周数
+
+   // 遍历历史订单
+   for(int i = 0; i < OrdersHistoryTotal(); i++) {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) {
+         if(OrderSymbol() == Symbol() && OrderMagicNumber() == MagicNumber) { // 过滤 EA 交易
+            totalTrades++;
+            totalProfit += OrderProfit();
+            datetime closeTime = OrderCloseTime();
+            // 计算周索引（基于第一笔订单的绝对时间差）
+            if(i == 0) {
+               firstCloseTime = closeTime; // 记录第一笔订单时间
+            }
+            int weekIndex = (int)((closeTime - firstCloseTime) / 604800); // 604800 秒 = 1 周
+            weeklyProfits[weekIndex] += OrderProfit();
+            totalWeeks = MathMax(totalWeeks, weekIndex + 1); // 更新总周数
+         }
+      }
+   }
+
+   if(totalWeeks == 0 || InitialCapital == 0) return 0.0;
+   // 调整数组大小
+   ArrayResize(weeklyProfits, totalWeeks);
+
+   // 计算每周收益率
+   int validWeeks = 0;
+   for(int i = 0; i < (int)totalWeeks; i++) {
+      if(weeklyProfits[i] != 0.0) { // 仅考虑有交易的周
+         weeklyProfitRate[validWeeks++] = weeklyProfits[i] / InitialCapital;
+      }
+   }
+   ArrayResize(weeklyProfitRate, validWeeks);
+
+   // 计算平均每周收益率
+   double meanWeeklyRate = 0.0;
+   for(int i = 0; i < validWeeks; i++) {
+      meanWeeklyRate += weeklyProfitRate[i];
+   }
+   meanWeeklyRate /= validWeeks;
+
+   // 计算收益率标准差
+   double variance = 0.0;
+   for(int i = 0; i < validWeeks; i++) {
+      variance += MathPow(weeklyProfitRate[i] - meanWeeklyRate, 2);
+   }
+   variance /= validWeeks;
+   // 每周收益率标准差
+   double weeklyStdDev = MathSqrt(variance);
+   if (weeklyStdDev <= 0){
+      Print("样本数据太少，无法计算夏普率");
+      return 0;
+   }
+
+   // 52周 年化收益率
+   double annualizedProfitRate = meanWeeklyRate * 52.0;
+   // 52周 年化标准差
+   double annualizedStdDev = weeklyStdDev * MathSqrt(52.0);
+   double sharpeRatio = (annualizedProfitRate - RISK_FREE_RATE) / annualizedStdDev;
+
+   Print("夏普率: ", DoubleToString(sharpeRatio * 100, 2), "% ");
+   Print("年化收益率: ", DoubleToString(annualizedProfitRate * 100, 2), "% , 当前总收益: ", DoubleToString(totalProfit, 2));
+   Print("交易周数: ", DoubleToString(validWeeks, 2), ", 平均每周收益率: ", DoubleToString(meanWeeklyRate * 100, 2), "% ");
+   Print("每周收益标准差：", DoubleToString(weeklyStdDev, 2), ", 年化收益标准差：", DoubleToString(annualizedStdDev, 2));
+
+   return sharpeRatio;
+}
+
+// 更新净值历史
+void UpdateEquityHistory(){
+   if (EquityHistoryCount % INITIAL_ARRAY_SIZE == 0){
+      ArrayResize(EquityHistory, EquityHistoryCount + INITIAL_ARRAY_SIZE);
+      ArrayResize(EquityHistoryTime, EquityHistoryCount + INITIAL_ARRAY_SIZE);
+   }
+   EquityHistory[EquityHistoryCount] = AccountEquity();
+   EquityHistoryTime[EquityHistoryCount] = TimeCurrent();
+   EquityHistoryCount++;
+
+}
+
+// 获取预付款比例
+void UpdateMarginLevel() {
+    double equity = AccountEquity();    // 账户净值
+    double margin = AccountMargin();    // 已用保证金
+
+    // 防止除以零
+    if (margin == 0.0) {
+      CurrentMarginLevel = MaxInt;
+      return;
+    }
+
+    CurrentMarginLevel = (equity / margin);
+
+    if (MiniMarginLevel <= 0 || MiniMarginLevel > CurrentMarginLevel){
+      MiniMarginLevel = CurrentMarginLevel;
+      MiniMarginLevelTime = TimeCurrent();
+    }
+
+    if (CurrentMarginLevel < 2){
+      //Print("当前预付款比例过小：", DoubleToString(CurrentMarginLevel * 100, 2), "%");
+    }
+}
+
+// 计算最大回撤
+double CalculateMaxDrawdown() {
+   // 初始最高净值
+   double maxEquity = InitialCapital;
+   datetime maxEquityTime = 0;
+   double maxDrawdown = 0.0;
+   double maxDrawdownEquity = 0.0;
+   datetime maxDrawdownTime = 0;
+   double maxDrawdownMaxEquity = 0.0;
+   datetime maxDrawdownMaxEquityTime = 0;
+
+   // 遍历净值历史
+   for(int i = 1; i < EquityHistoryCount; i++) {
+      if(EquityHistory[i] > maxEquity) {
+         maxEquity = EquityHistory[i]; // 更新高峰
+         maxEquityTime = EquityHistoryTime[i];
+      }else{
+         double drawdown = (maxEquity - EquityHistory[i]) / maxEquity;
+         if(drawdown > maxDrawdown) {
+            maxDrawdown = drawdown;
+            maxDrawdownEquity = EquityHistory[i];
+            maxDrawdownTime = EquityHistoryTime[i];
+
+            maxDrawdownMaxEquity = maxEquity;
+            maxDrawdownMaxEquityTime = maxEquityTime;
+         }
+      }
+   }
+
+   Print("当前杠杆倍数：1:", initialLeverage);
+   Print("最小预付款比率：", DoubleToString(MiniMarginLevel * 100, 2), "%, ", "时间：", MiniMarginLevelTime);
+   Print("最大回撤比率: ", DoubleToString(maxDrawdown * 100, 2), "%, ");
+   Print("最大回撤前的最大净值: ", DoubleToString(maxDrawdownMaxEquity, 2), ", ");
+   Print("最大回撤前的最大净值时间: ", maxDrawdownMaxEquityTime, ", ");
+   Print("最大回撤时的净值: ", DoubleToString(maxDrawdownEquity, 2), ", ");
+   Print("最大回撤时的净值时间: ", maxDrawdownTime, ", ");
+   return maxDrawdown;
+}
+
+
+// 计算最优杠杆比率 using Kelly Criterion
+double CalculateOptimalLeverage() {
+   int totalTrades = 0;
+   int winningTrades = 0;
+   double totalProfit = 0.0;
+   double totalLoss = 0.0;
+   double maxProfit = 0.0;
+   double maxLoss = 0.0;
+
+   // 遍历历史订单
+   for(int i = 0; i < OrdersHistoryTotal(); i++) {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) {
+         if(OrderSymbol() == Symbol() && OrderMagicNumber() == MagicNumber) {
+            totalTrades++;
+            double profit = OrderProfit();
+            if(profit > 0) {
+               winningTrades++;
+               totalProfit += profit;
+               maxProfit = MathMax(maxProfit, profit);
+            } else {
+               totalLoss += MathAbs(profit);
+               maxLoss = MathMax(maxLoss, MathAbs(profit));
+            }
+         }
+      }
+   }
+
+   if(totalTrades == 0 || winningTrades == 0 || totalLoss == 0) return 0.0; // 避免除零
+
+   // 计算胜率 W
+   double winRate = (double)winningTrades / totalTrades;
+
+   // 计算盈亏比 R (平均盈利 / 平均亏损)
+   double avgProfit = totalProfit / winningTrades;
+   double avgLoss = totalLoss / (totalTrades - winningTrades);
+   double riskRewardRatio = avgProfit / avgLoss;
+
+   // 计算凯利百分比
+   double kellyPercent = winRate - ((1 - winRate) / riskRewardRatio);
+   if(kellyPercent < 0) kellyPercent = 0.0; // 负值无效，设为 0
+
+   // 最大预期亏损
+   double maxLossPercent = maxLoss / InitialCapital;
+   // 完整凯利杠杆
+   double fullLeverage = kellyPercent / maxLossPercent;
+
+   // 半凯利降低风险
+   double halfKellyLeverage = fullLeverage / 2.0;
+
+   // 输出结果
+   Print("胜率: ", DoubleToString(winRate * 100, 2), "%");
+   Print("盈亏比 R: ", DoubleToString(riskRewardRatio * 100, 2), "%");
+   Print("最大预期亏损率: ", DoubleToString(maxLossPercent * 100, 2), "%");
+   Print("凯利百分比: ", DoubleToString(kellyPercent * 100, 2), "%");
+   Print("完整凯利杠杆: ", DoubleToString(fullLeverage, 2));
+   Print("半凯利杠杆: ", DoubleToString(halfKellyLeverage, 2));
+
+   // 返回半凯利杠杆作为推荐值
+   return halfKellyLeverage;
+}
